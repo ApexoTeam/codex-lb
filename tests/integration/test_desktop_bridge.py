@@ -5,7 +5,10 @@ import gzip
 import json
 import logging
 import os
+import signal
 import socket
+import sys
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -752,3 +755,243 @@ async def test_websocket_protocol_negotiation_does_not_log_offer(bridge, caplog,
             assert ws.protocol == (protocol if selected else None)
             assert (await ws.receive(timeout=2)).data == "ok"
     assert protocol not in caplog.text
+
+
+@asynccontextmanager
+async def bridge_process(tmp_path: Path, lb_port: int) -> AsyncIterator[tuple[asyncio.subprocess.Process, str, int]]:
+    """Run the real CLI with synthetic credentials and an exclusively owned process."""
+    write_auth(tmp_path / "auth.json")
+    token_file = tmp_path / "lb-token"
+    write_private(token_file, LB_TOKEN)
+    with bound_socket() as sock:
+        port = sock.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "app.cli",
+        "desktop-bridge",
+        "--listen-port",
+        str(port),
+        "--lb-port",
+        str(lb_port),
+        "--codex-home",
+        str(tmp_path),
+        "--lb-token-file",
+        str(token_file),
+        cwd=Path(__file__).resolve().parents[2],
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(10), aiohttp.ClientSession() as client:
+            while True:
+                if process.returncode is not None:
+                    pytest.fail(f"Bridge exited during startup: {(await process.communicate())!r}")
+                try:
+                    async with client.get(url) as response:
+                        assert response.status == 404
+                    break
+                except aiohttp.ClientConnectorError:
+                    await asyncio.sleep(0.02)
+        yield process, url, port
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
+@pytest.mark.parametrize("finish_http", [True, False])
+async def test_sigterm_closes_websocket_drains_or_aborts_http_and_releases_port(tmp_path, finish_http):
+    finish = asyncio.Event()
+    cancelled = asyncio.Event()
+    upstream_closed = asyncio.Event()
+    calls = []
+    close_codes = []
+
+    async def upstream(request):
+        calls.append(request.path)
+        if request.path.endswith("responses"):
+            ws = web.WebSocketResponse(autoclose=False)
+            await ws.prepare(request)
+            message = await ws.receive()
+            close_codes.append(message.data)
+            await ws.close()
+            upstream_closed.set()
+            return ws
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b"data: started\n\n")
+        try:
+            await finish.wait()
+            await response.write(b"data: completed\n\n")
+            return response
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    lb_sock = bound_socket()
+    lb = web.Application()
+    lb.router.add_route("*", "/{tail:.*}", upstream)
+    async with serve(lb, lb_sock), bridge_process(tmp_path, lb_sock.getsockname()[1]) as (process, url, port):
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {CLIENT_TOKEN}"}) as client:
+            async with client.ws_connect(url + "/backend-api/codex/responses") as ws:
+                async with client.post(url + "/backend-api/codex/synthetic-stream") as response:
+                    assert await response.content.readexactly(15) == b"data: started\n\n"
+                    started = time.monotonic()
+                    process.send_signal(signal.SIGTERM)
+                    message = await ws.receive(timeout=2)
+                    assert message.type == aiohttp.WSMsgType.CLOSE
+                    assert message.data == 1001
+                    if finish_http:
+                        finish.set()
+                        assert await asyncio.wait_for(response.read(), 2) == b"data: completed\n\n"
+                    else:
+                        with pytest.raises(aiohttp.ClientPayloadError):
+                            await asyncio.wait_for(response.read(), 15)
+                        await asyncio.wait_for(cancelled.wait(), 2)
+                    await asyncio.wait_for(upstream_closed.wait(), 2)
+                    assert await asyncio.wait_for(process.wait(), 3) == 0
+                    elapsed = time.monotonic() - started
+                    assert elapsed < (3 if finish_http else 15)
+                    print(f"SIGTERM finish_http={finish_http}: {elapsed:.3f}s")
+        stdout, stderr = await process.communicate()
+        for secret in (CLIENT_TOKEN.encode(), LB_TOKEN.encode()):
+            assert secret not in stdout + stderr
+        assert b"Traceback" not in stderr
+        assert b"Task was destroyed" not in stderr
+        with socket.socket() as released:
+            released.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            released.bind(("127.0.0.1", port))
+    assert calls == ["/backend-api/codex/responses", "/backend-api/codex/synthetic-stream"]
+    assert close_codes == [1001]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
+async def test_sigterm_closes_websockets_when_peers_do_not_acknowledge(tmp_path):
+    close_codes = []
+
+    async def upstream(request):
+        ws = web.WebSocketResponse(autoclose=False)
+        await ws.prepare(request)
+        message = await ws.receive()
+        close_codes.append(message.data)
+        await ws.close()
+        return ws
+
+    lb_sock = bound_socket()
+    lb = web.Application()
+    lb.router.add_route("*", "/{tail:.*}", upstream)
+    peers = []
+    async with serve(lb, lb_sock), bridge_process(tmp_path, lb_sock.getsockname()[1]) as (process, _, port):
+        try:
+            for _ in range(2):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                peers.append((reader, writer))
+                writer.write(
+                    (
+                        "GET /backend-api/codex/responses HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{port}\r\n"
+                        "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                        f"Authorization: Bearer {CLIENT_TOKEN}\r\n\r\n"
+                    ).encode()
+                )
+                await writer.drain()
+                assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 101 ")
+            started = time.monotonic()
+            process.send_signal(signal.SIGTERM)
+            for reader, _ in peers:
+                # Deliberately leave both close frames unacknowledged.
+                assert await asyncio.wait_for(reader.readexactly(4), 2) == b"\x88\x02\x03\xe9"
+            assert await asyncio.wait_for(process.wait(), 13) == 0
+            assert time.monotonic() - started < 13
+            for reader, _ in peers:
+                assert await asyncio.wait_for(reader.read(), 1) == b""
+        finally:
+            for _, writer in peers:
+                writer.close()
+                await writer.wait_closed()
+    assert close_codes == [1001, 1001]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
+async def test_sigterm_rejects_upstream_handshake_that_completes_after_shutdown(tmp_path):
+    received = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    close_codes = []
+
+    async def upstream(request):
+        received.set()
+        await release.wait()
+        ws = web.WebSocketResponse(autoclose=False)
+        await ws.prepare(request)
+        close_codes.append((await ws.receive()).data)
+        await ws.close()
+        closed.set()
+        return ws
+
+    lb_sock = bound_socket()
+    lb = web.Application()
+    lb.router.add_route("*", "/{tail:.*}", upstream)
+    async with serve(lb, lb_sock), bridge_process(tmp_path, lb_sock.getsockname()[1]) as (process, url, port):
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {CLIENT_TOKEN}"}) as client:
+
+            async def connect():
+                return await client.ws_connect(url + "/backend-api/codex/responses")
+
+            handshake = asyncio.create_task(connect())
+            try:
+                await asyncio.wait_for(received.wait(), 2)
+                process.send_signal(signal.SIGTERM)
+                async with asyncio.timeout(2):
+                    while True:
+                        try:
+                            _, writer = await asyncio.open_connection("127.0.0.1", port)
+                        except (ConnectionRefusedError, ConnectionResetError):
+                            break
+                        writer.close()
+                        await writer.wait_closed()
+                        await asyncio.sleep(0.01)
+                release.set()
+                with pytest.raises(aiohttp.WSServerHandshakeError) as error:
+                    await asyncio.wait_for(handshake, 2)
+                assert error.value.status == 503
+                await asyncio.wait_for(closed.wait(), 2)
+                assert await asyncio.wait_for(process.wait(), 2) == 0
+            finally:
+                handshake.cancel()
+                await asyncio.gather(handshake, return_exceptions=True)
+    assert close_codes == [1001]
+
+
+async def test_unavailable_upstream_recovers_when_lb_starts_without_bridge_restart(tmp_path):
+    write_auth(tmp_path / "auth.json")
+    token_file = tmp_path / "lb-token"
+    write_private(token_file, LB_TOKEN)
+    lb_sock, bridge_sock = bound_socket(), bound_socket()
+    config = BridgeConfig(bridge_sock.getsockname()[1], lb_sock.getsockname()[1], tmp_path, token_file)
+    calls = []
+
+    async def upstream(request):
+        calls.append(request.path)
+        assert request.headers["Authorization"] == f"Bearer {LB_TOKEN}"
+        return web.Response(text="ready")
+
+    lb = web.Application()
+    lb.router.add_route("*", "/{tail:.*}", upstream)
+    try:
+        async with serve(create_bridge_app(config), bridge_sock):
+            async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {CLIENT_TOKEN}"}) as client:
+                url = f"http://127.0.0.1:{config.listen_port}/backend-api/codex/models"
+                async with client.get(url) as response:
+                    assert response.status == 502
+                async with serve(lb, lb_sock):
+                    async with client.get(url) as response:
+                        assert response.status == 200
+                        assert await response.text() == "ready"
+    finally:
+        lb_sock.close()
+    assert calls == ["/backend-api/codex/models"]

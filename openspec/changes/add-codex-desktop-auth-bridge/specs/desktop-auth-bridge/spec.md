@@ -213,6 +213,32 @@ active-request slot.
 - **WHEN** the downstream client disconnects abruptly
 - **THEN** the upstream WebSocket is closed and the active slot is released
 
+### Requirement: Process shutdown closes sessions and bounds HTTP draining
+
+When the bridge receives a graceful process-stop signal, it MUST stop admitting
+new requests and close established WebSockets with code 1001. WebSocket closes
+MUST run concurrently with a 10-second close deadline; a peer that does not
+finish the close handshake MUST have its transport closed. A WebSocket handshake
+that finishes after shutdown begins MUST NOT escape this cleanup. HTTP handlers
+MUST receive a 5-second graceful completion window after WebSocket shutdown,
+followed by a bounded 5-second cancellation window. Incomplete HTTP streams MUST
+be disconnected without a fabricated completed response. Shutdown MUST NOT
+retry or replay a request, and all relay pumps MUST be cancelled and awaited
+before the process exits.
+
+#### Scenario: SIGTERM closes open sessions and releases the port
+
+- **GIVEN** an established WebSocket and an unfinished HTTP event stream
+- **WHEN** the bridge process receives SIGTERM
+- **THEN** the WebSocket peer receives close code 1001
+- **AND** the HTTP stream either completes during its grace window or disconnects without a completed response
+- **AND** the upstream observes only one dispatch of each request and the bridge exits with its listening port released
+
+#### Scenario: an unresponsive WebSocket peer cannot hold shutdown open
+
+- **WHEN** a WebSocket peer does not acknowledge the shutdown close frame
+- **THEN** the bridge closes its transport no later than the 10-second close deadline and continues shutdown
+
 ### Requirement: The bridge keeps request metadata out of logs
 
 The bridge MUST NOT emit access logs, MUST NOT let its WebSocket client library

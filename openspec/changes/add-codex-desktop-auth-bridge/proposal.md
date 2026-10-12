@@ -22,6 +22,8 @@ issue; it does not claim to resolve every Desktop surface it mentions.
 - HTTP bodies and WebSocket messages are relayed opaquely and bounded: no
   decompression, cookies, environment proxies, automatic client headers, or
   redirects. Upstream 3xx and 401 become a generic 502.
+- Bound process shutdown while HTTP or WebSocket relays are active: cancel and
+  await owned relay work, close both connections, and release request slots.
 - No `CODEX_LB_*` setting, environment knob, database, dashboard, or main-server
   change. Codex Desktop keeps the built-in OpenAI provider via
   `openai_base_url`; no client feature is disabled.
@@ -38,6 +40,10 @@ issue; it does not claim to resolve every Desktop surface it mentions.
   OpenSpec, not the README (P4); nothing dashboard-visible (P5).
 - Scope limits: native OAuth file storage (`auth.json`) only. Agent-identity,
   keyring-only, API-key-mode, and externally managed token stores fail closed.
-  Local acceptance covers the installed Desktop runtime's model discovery,
-  normal turn, and prediction-mode fork/turn. The visible Composer UI, realtime,
-  and mobile surfaces remain unverified and are not claimed.
+  Local acceptance covers model discovery, a normal turn, and a prediction-mode
+  fork/turn. A separate manual macOS test with Desktop `26.1007.30912`, runtime
+  `0.162.0-alpha.17.2`, and stable CodexLB `1.24.0` confirmed that a Composer
+  suggestion appeared automatically in the same thread after about 10 seconds
+  and Tab accepted it. This is one tested setup and a user-observed timing, not
+  a latency guarantee. Realtime, mobile, Windows, and remote-host behavior
+  remain unverified.

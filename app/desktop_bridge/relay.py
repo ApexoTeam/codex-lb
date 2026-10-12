@@ -34,6 +34,7 @@ MAX_ACTIVE_REQUESTS = 16
 CONNECT_TIMEOUT_SECONDS = 10
 IDLE_TIMEOUT_SECONDS = 300
 MAX_LIFETIME_SECONDS = 7200
+HTTP_SHUTDOWN_GRACE_SECONDS = 5
 
 _MAX_BODY_BYTES: Final[int] = MAX_DECOMPRESSED_RESPONSES_BODY_BYTES
 _SKIP_AUTO_HEADERS: Final = ("User-Agent", "Accept", "Accept-Encoding", "Content-Type")
@@ -68,6 +69,8 @@ class _BridgeState:
     config: BridgeConfig
     session: aiohttp.ClientSession | None = None
     active: int = 0
+    stopping: bool = False
+    websockets: dict[web.WebSocketResponse, web.Request] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,13 +120,30 @@ def create_bridge_app(config: BridgeConfig) -> web.Application:
     )
     app[_STATE] = _BridgeState(config=config)
     app.cleanup_ctx.append(_client_session)
+    app.on_shutdown.append(_shutdown_websockets)
     app.router.add_route("*", "/{tail:.*}", _handle)
     return app
 
 
 def run_bridge(config: BridgeConfig) -> None:
     """Serve the bridge on 127.0.0.1 until interrupted."""
-    web.run_app(create_bridge_app(config), host=policy.LOOPBACK_HOST, port=config.listen_port, access_log=None)
+    web.run_app(
+        create_bridge_app(config),
+        host=policy.LOOPBACK_HOST,
+        port=config.listen_port,
+        access_log=None,
+        shutdown_timeout=HTTP_SHUTDOWN_GRACE_SECONDS,
+    )
+
+
+async def _shutdown_websockets(app: web.Application) -> None:
+    state = app[_STATE]
+    state.stopping = True
+    # Closing a downstream receive wakes its relay pumps. TaskGroup owns every
+    # close, and each has its own deadline, so 16 peers cannot multiply the wait.
+    async with asyncio.TaskGroup() as closes:
+        for websocket, request in tuple(state.websockets.items()):
+            closes.create_task(_close_websocket(request, websocket, _CloseFrame(1001, "")))
 
 
 async def _client_session(app: web.Application) -> AsyncIterator[None]:
@@ -147,6 +167,8 @@ async def _client_session(app: web.Application) -> AsyncIterator[None]:
 
 async def _handle(request: web.Request) -> web.StreamResponse:
     state = request.app[_STATE]
+    if state.stopping:
+        return _error(503)
     config = state.config
     try:
         raw_target = policy.checked_target(request.method, request.raw_path)
@@ -271,6 +293,9 @@ async def _relay_websocket(request: web.Request, lb_port: int, raw_target: str, 
     except Exception:
         return _error(502)
     try:
+        state = request.app[_STATE]
+        if state.stopping:
+            return _error(503)
         websocket = web.WebSocketResponse(
             protocols=(upstream.subprotocol,) if upstream.subprotocol else (),
             compress=False,
@@ -289,7 +314,15 @@ async def _relay_websocket(request: web.Request, lb_port: int, raw_target: str, 
             handshake_headers.popall("Sec-WebSocket-Protocol", None)
             handshake_request = request.clone(headers=handshake_headers)
         await websocket.prepare(handshake_request)
-        await _relay_messages(request, websocket, upstream)
+        state.websockets[websocket] = request
+        try:
+            # Shutdown may have begun while prepare yielded, after its snapshot.
+            if state.stopping:
+                await _close_websocket(request, websocket, _CloseFrame(1001, ""))
+            else:
+                await _relay_messages(request, websocket, upstream)
+        finally:
+            state.websockets.pop(websocket, None)
         return websocket
     finally:
         with suppress(Exception):
@@ -330,11 +363,17 @@ async def _relay_messages(request: web.Request, websocket: web.WebSocketResponse
     fallback = _CloseFrame(1011 if failed else 1001, "")
     to_upstream = from_client if isinstance(from_client, _CloseFrame) else fallback
     to_client = from_upstream if isinstance(from_upstream, _CloseFrame) else fallback
+    if request.app[_STATE].stopping:
+        to_upstream = to_client = _CloseFrame(1001, "")
     with suppress(Exception):
         await upstream.close(to_upstream.code, to_upstream.reason)
+    await _close_websocket(request, websocket, to_client)
+
+
+async def _close_websocket(request: web.Request, websocket: web.WebSocketResponse, frame: _CloseFrame) -> None:
     try:
         async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
-            await websocket.close(code=to_client.code, message=to_client.reason.encode())
+            await websocket.close(code=frame.code, message=frame.reason.encode())
     except Exception:
         _abort(request)
 

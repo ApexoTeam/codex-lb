@@ -10,6 +10,7 @@
 - [x] 2.4 Relay WebSocket handshakes and messages with no redirects, bounded lifetime, and owned pumps (`relay.py`).
 - [x] 2.5 Wire the opt-in `codex-lb desktop-bridge` CLI subcommand to `run_bridge`.
 - [x] 2.6 Publish `docs/desktop-bridge.md`, linked from client setup and back to the OpenSpec capability.
+- [x] 2.7 Bound process shutdown with active HTTP and WebSocket relays; cancel and await owned relay work, close connections, release slots, and verify these outcomes with integration tests.
 
 ## 3. Verification and delivery
 
@@ -20,5 +21,6 @@
 - [x] 3.5 Complete an isolated real-client acceptance run: model discovery, normal WebSocket response, prediction-mode fork/turn.
 - [x] 3.6 Manually verify the visible Composer UI on macOS: suggestion appeared in the same thread after about 10 seconds and Tab accepted it. This confirms the tested setup; realtime/mobile remain outside this initial scope.
 - [x] 3.7 Sync the capability into `openspec/specs/desktop-auth-bridge/`.
-- [ ] 3.8 Submit for maintainer review after local acceptance; archive the verified change after merge with `--skip-specs` because the canonical spec is already synchronized.
+- [x] 3.8 Submit for maintainer review after local acceptance ([PR #2597](https://github.com/Soju06/codex-lb/pull/2597)).
 - [x] 3.9 Verify the strict docs build, abrupt WebSocket disconnect, and recovery after an incomplete credential write following independent review.
+- [ ] 3.10 Archive the verified change after merge with `--skip-specs` because the canonical spec is already synchronized.

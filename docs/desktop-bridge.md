@@ -107,6 +107,18 @@ HTTP and WebSocket compatibility, and restart between active sessions. Keep the
 previous environment, including its dependencies, for rollback. This contribution
 does not provide that installer or guarantee compatibility with future clients.
 
+On a graceful process stop, the bridge closes WebSockets with code 1001 and
+allows short HTTP responses to finish. Unfinished streams are disconnected
+without replay. WebSocket cleanup has a concurrent 10-second deadline; HTTP
+completion and cancellation each have a 5-second window afterward. Set a
+supervisor's forced-stop timeout to at least 45 seconds to leave room for
+transport cleanup. Schedule restarts between active turns: shutdown does not
+transfer work to the replacement process.
+
+The bridge can start before a local Docker LB is ready. Requests return 502
+until the LB begins listening, and subsequent requests recover without a bridge
+restart. The bridge does not retry the failed request automatically.
+
 ## Data handling
 
 The Desktop bearer is compared locally and removed before forwarding. The LB
@@ -132,7 +144,7 @@ database, or diagnostic exports are needed for contributing this feature.
 | `405` before dispatch | `CONNECT` or `TRACE` reaching the request-policy check |
 | `403` before dispatch | Missing/mismatched bearer, unsupported identity, Host or Origin policy failure |
 | Persistent `403` after a shared login refresh | Desktop may still hold an old token; restart it, then recheck the file-backed login |
-| `503` before dispatch | Credential file became unavailable/invalid, or all 16 relay slots are occupied |
+| `503` before dispatch | Credential file became unavailable/invalid, all 16 relay slots are occupied, or shutdown has begun |
 | `502` | LB returned `401` or a redirect, or the upstream connection failed |
 | `413` | Request exceeds the 128 MiB body budget |
 | LB `403`, `426`, `429`, etc. | Passed through with sanitized headers; investigate the LB response |

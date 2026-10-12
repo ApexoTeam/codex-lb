@@ -97,6 +97,23 @@ can stage a specific stable release, run compatibility checks and keep the previ
 complete environment for rollback. A host bridge and a containerized LB have
 separate processes and installation environments.
 
+Graceful process shutdown sends established WebSocket peers close code 1001.
+Their closes run concurrently with a 10-second deadline, followed by aiohttp's
+5-second HTTP completion window and 5-second cancellation window. Short HTTP
+responses may finish; unfinished streams are disconnected without replay. A
+late upstream WebSocket handshake is refused with 503 and its upstream closed.
+The listener stops accepting immediately, but a restart is still a connection
+interruption rather than a transfer of active model work to another process.
+Allow an external supervisor at least 45 seconds before forced termination,
+covering these phases, upstream close cleanup and scheduling overhead. These
+deadlines rely on the supported transports honoring asyncio cancellation;
+the supervisor remains the final bound for an unresponsive process.
+
+Starting the bridge does not require the LB to be ready. Requests return 502
+while its listener is unavailable; later requests recover in the same bridge
+process when the LB starts. This supports a host login occurring before Docker
+finishes startup without adding a request retry or a dependency polling loop.
+
 The canonical spec is already synchronized for documentation links. After the
 change is verified and merged, archive it with `--skip-specs` to avoid applying
 the same added requirements a second time. Do not archive before verification.
