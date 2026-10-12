@@ -28,6 +28,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    desktop_bridge = subparsers.add_parser(
+        "desktop-bridge",
+        help="Run the experimental loopback Codex Desktop auth bridge (see docs/desktop-bridge.md).",
+        formatter_class=_CliHelpFormatter,
+    )
+    desktop_bridge.add_argument("--listen-port", required=True, type=_parse_bridge_port, metavar="PORT")
+    desktop_bridge.add_argument("--lb-port", default=2455, type=_parse_bridge_port, metavar="PORT")
+    desktop_bridge.add_argument("--lb-token-file", required=True, type=Path, metavar="PATH")
+    desktop_bridge.add_argument(
+        "--codex-home",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Codex data directory containing file-backed ChatGPT auth. Defaults to the local Codex home.",
+    )
+
     codex_sessions = subparsers.add_parser(
         "codex-sessions",
         help="Manage local Codex session metadata.",
@@ -140,6 +156,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
 
+    if args.command == "desktop-bridge":
+        _run_desktop_bridge(args)
+        return
+
     if args.command == "codex-sessions":
         if args.codex_sessions_command == "retag":
             _run_codex_sessions_retag(args)
@@ -169,6 +189,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         proxy_headers=False,
         log_config=_build_log_config(),
     )
+
+
+def _parse_bridge_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def _run_desktop_bridge(args: argparse.Namespace) -> None:
+    from app.desktop_bridge import BridgeConfig, run_bridge
+
+    if args.listen_port == args.lb_port:
+        raise SystemExit("--listen-port and --lb-port must differ")
+    config = BridgeConfig(
+        listen_port=args.listen_port,
+        lb_port=args.lb_port,
+        codex_home=args.codex_home.expanduser() if args.codex_home is not None else default_codex_home(),
+        lb_token_file=args.lb_token_file.expanduser(),
+    )
+    try:
+        run_bridge(config)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def _run_admin_command(args: argparse.Namespace) -> None:
