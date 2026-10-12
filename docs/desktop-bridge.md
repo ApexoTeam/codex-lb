@@ -127,6 +127,9 @@ database, or diagnostic exports are needed for contributing this feature.
 
 | Result | Meaning |
 | --- | --- |
+| `400` before dispatch | Malformed target (non-origin form, dot segment, encoded escape, `//`, backslash or fragment), or a WebSocket subprotocol offer split across header fields |
+| `404` before dispatch | Path outside `/backend-api/codex`, or an authority-form `CONNECT` rejected by routing |
+| `405` before dispatch | `CONNECT` or `TRACE` reaching the request-policy check |
 | `403` before dispatch | Missing/mismatched bearer, unsupported identity, Host or Origin policy failure |
 | Persistent `403` after a shared login refresh | Desktop may still hold an old token; restart it, then recheck the file-backed login |
 | `503` before dispatch | Credential file became unavailable/invalid, or all 16 relay slots are occupied |

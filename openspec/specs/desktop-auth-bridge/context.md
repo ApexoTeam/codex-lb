@@ -5,9 +5,9 @@
 Codex Desktop signed in with ChatGPT keeps the built-in OpenAI provider and
 sends `Authorization: Bearer <ChatGPT access token>` to `openai_base_url`.
 codex-lb with API-key auth expects an LB key instead. The bridge is a small
-loopback relay that proves the caller can read the local `auth.json`, then
-swaps that bearer for the LB key. It is related to public issue #2262 and is an
-independent implementation; no community bridge code was reused.
+loopback relay that checks the caller's bearer against the current access token
+in the local `auth.json`, then swaps it for the LB key. It is related to public
+issue #2262 and is an independent implementation; no community bridge code was reused.
 
 ## Decisions
 
@@ -15,9 +15,10 @@ independent implementation; no community bridge code was reused.
   subcommand with its own aiohttp app. It imports no settings, database, or
   `app.main`, so the main server and its routing are untouched and the feature
   is off unless started (PRINCIPLES P1/P2).
-- **Possession of `auth.json` is the local credential.** Comparing the inbound
-  bearer to the current `tokens.access_token` limits the bridge to processes
-  that can already read the user's Codex login. The file is re-read per request
+- **Possession of the current access token is the local credential.** Comparing
+  the inbound bearer to the current `tokens.access_token` limits the bridge to
+  callers that possess that token, including a caller with a copied token who
+  cannot read `auth.json` directly. The file is re-read per request
   so Codex token refreshes keep working; the bridge never writes it.
   This does not make credential rotation seamless: a partial in-place write is
   refused with 503, and a client retaining the previous token receives 403 until
