@@ -39,11 +39,14 @@ class CredentialError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class LocalCredentials:
+    """Hold the current Desktop and LB tokens without exposing them in repr output."""
+
     access_token: str = field(repr=False)
     lb_token: str = field(repr=False)
 
 
 def load_credentials(codex_home: Path, lb_token_file: Path) -> LocalCredentials:
+    """Re-read both private files and return validated tokens, or raise CredentialError."""
     return LocalCredentials(access_token=read_access_token(codex_home), lb_token=read_lb_token(lb_token_file))
 
 
@@ -53,6 +56,7 @@ def is_visible_ascii(value: str) -> bool:
 
 
 def read_access_token(codex_home: Path) -> str:
+    """Read a file-backed ChatGPT token; reject API-key logins and malformed credentials."""
     raw = _read_private_file(codex_home / AUTH_FILE_NAME, MAX_AUTH_FILE_BYTES, _AUTH_LABEL)
     try:
         document = json.loads(raw)
@@ -73,6 +77,7 @@ def read_access_token(codex_home: Path) -> str:
 
 
 def read_lb_token(token_file: Path) -> str:
+    """Read one visible-ASCII LB key, allowing a single optional LF or CRLF terminator."""
     raw = _read_private_file(token_file, MAX_TOKEN_FILE_BYTES, _TOKEN_LABEL)
     if raw.endswith(b"\r\n"):
         raw = raw[:-2]
@@ -86,6 +91,7 @@ def read_lb_token(token_file: Path) -> str:
 
 
 def _read_private_file(path: Path, limit: int, label: str) -> bytes:
+    """Read a bounded regular file, enforcing no-follow and owner-only access where supported."""
     try:
         fd = os.open(path, _OPEN_FLAGS)
     except OSError:

@@ -67,6 +67,7 @@ class PolicyRejection(Exception):
     """A request the bridge refuses before contacting codex-lb."""
 
     def __init__(self, status: int) -> None:
+        """Store the local HTTP rejection status without retaining request details."""
         super().__init__(status)
         self.status = status
 
@@ -89,18 +90,21 @@ def checked_target(method: str, raw_target: str) -> str:
 
 
 def check_host(host_values: list[str], listen_port: int) -> None:
+    """Require exactly one loopback Host header matching the bridge listen port."""
     allowed = (f"{LOOPBACK_HOST}:{listen_port}", f"localhost:{listen_port}")
     if len(host_values) != 1 or host_values[0].lower() not in allowed:
         raise PolicyRejection(403)
 
 
 def check_no_origin(origin_values: list[str]) -> None:
+    """Reject every Origin header, including an empty value, with status 403."""
     # Desktop's native client sends no Origin; any browser-originated call is refused.
     if origin_values:
         raise PolicyRejection(403)
 
 
 def bearer_token(authorization_values: list[str]) -> str:
+    """Extract one visible-ASCII bearer token or reject the request with status 403."""
     if len(authorization_values) != 1:
         raise PolicyRejection(403)
     scheme, separator, token = authorization_values[0].partition(" ")
@@ -110,11 +114,13 @@ def bearer_token(authorization_values: list[str]) -> str:
 
 
 def tokens_match(presented: str, expected: str) -> bool:
+    """Compare two validated ASCII tokens with constant-time equality checking."""
     # Both sides are visible ASCII, which compare_digest accepts as str.
     return hmac.compare_digest(presented, expected)
 
 
 def offered_subprotocols(protocol_values: list[str]) -> list[str]:
+    """Parse one WebSocket protocol field; reject split offers to avoid negotiation ambiguity."""
     # aiohttp negotiates against the first field only, so a split offer is refused.
     if len(protocol_values) > 1:
         raise PolicyRejection(400)
@@ -141,11 +147,13 @@ def response_headers(items: Iterable[tuple[str, str]], *, websocket: bool) -> li
 
 
 def _without(fields: list[tuple[str, str]], dropped: frozenset[str], *, websocket: bool) -> list[tuple[str, str]]:
+    """Filter excluded and Connection-nominated fields while preserving order and duplicates."""
     excluded = dropped | _connection_nominated(fields) | (_WEBSOCKET_HANDSHAKE if websocket else frozenset())
     return [(name, value) for name, value in fields if name.lower() not in excluded]
 
 
 def _connection_nominated(fields: list[tuple[str, str]]) -> frozenset[str]:
+    """Collect case-insensitive hop-by-hop field names from every Connection header."""
     return frozenset(
         token.strip().lower()
         for name, value in fields

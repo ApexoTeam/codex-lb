@@ -11,6 +11,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_desktop_bridge_dispatch_isolated_from_main_server_and_its_environment(monkeypatch, tmp_path):
+    """Dispatch bridge options without parsing unrelated main-server environment settings."""
     from app import desktop_bridge
 
     captured = []
@@ -33,6 +34,7 @@ def test_desktop_bridge_dispatch_isolated_from_main_server_and_its_environment(m
 
 
 def test_desktop_bridge_accepts_explicit_paths_and_port(monkeypatch, tmp_path):
+    """Pass explicit ports and credential paths into the bridge configuration unchanged."""
     from app import desktop_bridge
 
     captured = []
@@ -56,6 +58,7 @@ def test_desktop_bridge_accepts_explicit_paths_and_port(monkeypatch, tmp_path):
 @pytest.mark.parametrize("flag", ["--listen-port", "--lb-port"])
 @pytest.mark.parametrize("value", ["0", "-1", "65536", "invalid"])
 def test_desktop_bridge_rejects_invalid_port_before_running(monkeypatch, flag, value):
+    """Reject nonnumeric and out-of-range ports during argument parsing before startup."""
     monkeypatch.setattr(cli, "_run_desktop_bridge", lambda args: pytest.fail("invalid config must not run"))
     with pytest.raises(SystemExit) as error:
         cli.main(["desktop-bridge", "--listen-port", "2456", "--lb-token-file", "synthetic", flag, value])
@@ -64,20 +67,24 @@ def test_desktop_bridge_rejects_invalid_port_before_running(monkeypatch, flag, v
 
 @pytest.mark.parametrize("argv", [["desktop-bridge"], ["desktop-bridge", "--listen-port", "2456"]])
 def test_desktop_bridge_requires_port_and_token_file(argv):
+    """Report a usage error when either required bridge argument is absent."""
     with pytest.raises(SystemExit) as error:
         cli.main(argv)
     assert error.value.code == 2
 
 
 def test_desktop_bridge_rejects_loopback_to_itself():
+    """Reject a listener port that equals the default upstream port."""
     with pytest.raises(SystemExit, match="must differ"):
         cli.main(["desktop-bridge", "--listen-port", "2455", "--lb-token-file", "synthetic"])
 
 
 def test_desktop_bridge_reports_credential_error_without_traceback(monkeypatch):
+    """Convert credential startup failures into a concise CLI exit message."""
     from app import desktop_bridge
 
     def fail(config):
+        """Simulate startup rejecting an unreadable or unsafe token file."""
         raise ValueError("The LB token file is missing, unreadable, or a symlink.")
 
     monkeypatch.setattr(desktop_bridge, "run_bridge", fail)
@@ -86,9 +93,11 @@ def test_desktop_bridge_reports_credential_error_without_traceback(monkeypatch):
 
 
 def test_help_does_not_import_bridge_or_main_server(monkeypatch):
+    """Render bridge help without loading application or logging runtime modules."""
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
+        """Fail on runtime imports while delegating all other imports to Python."""
         if name in {"app.desktop_bridge", "app.main", "app.core.runtime_logging"}:
             pytest.fail(f"help must not import {name}")
         return original_import(name, *args, **kwargs)

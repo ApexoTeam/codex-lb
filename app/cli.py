@@ -22,6 +22,7 @@ class _CliHelpFormatter(argparse.HelpFormatter):
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse server options and isolated subcommands without starting either process."""
     parser = argparse.ArgumentParser(
         description="Run the codex-lb API server.",
         formatter_class=_CliHelpFormatter,
@@ -154,6 +155,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Dispatch CLI commands, or validate server options before starting the API server."""
     args = _parse_args(argv)
 
     if args.command == "desktop-bridge":
@@ -192,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 def _parse_bridge_port(value: str) -> int:
+    """Parse a TCP port in 1–65535, reporting invalid values through argparse."""
     try:
         port = int(value)
     except ValueError:
@@ -202,6 +205,7 @@ def _parse_bridge_port(value: str) -> int:
 
 
 def _run_desktop_bridge(args: argparse.Namespace) -> None:
+    """Resolve local credential paths and run the bridge with concise startup errors."""
     from app.desktop_bridge import BridgeConfig, run_bridge
 
     if args.listen_port == args.lb_port:

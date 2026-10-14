@@ -13,6 +13,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("listen,upstream", [(0, 2455), (2456, 0), (65536, 2455), (True, 2455), (2455, 2455)])
 def test_invalid_topology_fails_before_credentials_are_opened(tmp_path, listen, upstream):
+    """Validate port types, ranges, and separation before accessing missing credential paths."""
     config = BridgeConfig(listen, upstream, tmp_path / "missing-home", tmp_path / "missing-token")
     with pytest.raises(ValueError, match="port") as error:
         create_bridge_app(config)
@@ -20,6 +21,7 @@ def test_invalid_topology_fails_before_credentials_are_opened(tmp_path, listen, 
 
 
 def test_missing_credentials_fail_before_binding(tmp_path):
+    """Reject unavailable startup credentials without disclosing their paths."""
     config = BridgeConfig(2456, 2455, tmp_path, tmp_path / "missing-token")
     with pytest.raises(ValueError) as error:
         create_bridge_app(config)
@@ -27,6 +29,7 @@ def test_missing_credentials_fail_before_binding(tmp_path):
 
 
 def test_standalone_import_does_not_bootstrap_database_or_main_app():
+    """Verify in a fresh interpreter that bridge imports leave server and database runtimes unloaded."""
     repo = Path(__file__).resolve().parents[2]
     process = subprocess.run(
         [

@@ -58,6 +58,8 @@ _SILENT_SERVER_LOGGER: Final = logging.Logger("codex_lb.desktop_bridge.server", 
 
 @dataclass(frozen=True, slots=True)
 class BridgeConfig:
+    """Describe loopback ports and credential paths for one standalone bridge process."""
+
     listen_port: int
     lb_port: int
     codex_home: Path
@@ -66,6 +68,8 @@ class BridgeConfig:
 
 @dataclass(slots=True)
 class _BridgeState:
+    """Track the shared client session, request capacity, and sockets owned by this app."""
+
     config: BridgeConfig
     session: aiohttp.ClientSession | None = None
     active: int = 0
@@ -75,15 +79,20 @@ class _BridgeState:
 
 @dataclass(frozen=True, slots=True)
 class _CloseFrame:
+    """Carry a relayable WebSocket close status and reason between the message pumps."""
+
     code: int
     reason: str
 
 
 @dataclass(slots=True)
 class _Activity:
+    """Track the latest message activity using the monotonic clock for idle deadlines."""
+
     last: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
+        """Reset the shared idle deadline after a message arrives from either peer."""
         self.last = time.monotonic()
 
 
@@ -95,6 +104,7 @@ class _NoRedirectConnect(connect):
     """websockets' ``connect`` follows redirects by default; the bridge never does."""
 
     def process_redirect(self, exc: Exception) -> Exception | str:
+        """Return the handshake failure unchanged so the client never follows a redirect."""
         return exc
 
 
@@ -137,6 +147,7 @@ def run_bridge(config: BridgeConfig) -> None:
 
 
 async def _shutdown_websockets(app: web.Application) -> None:
+    """Stop admission and concurrently close tracked sockets with bounded going-away closes."""
     state = app[_STATE]
     state.stopping = True
     # Closing a downstream receive wakes its relay pumps. TaskGroup owns every
@@ -147,6 +158,7 @@ async def _shutdown_websockets(app: web.Application) -> None:
 
 
 async def _client_session(app: web.Application) -> AsyncIterator[None]:
+    """Own a credential-neutral HTTP client session for the application lifetime."""
     state = app[_STATE]
     # force_close: an upstream socket is never reused, so a stale keep-alive
     # connection can neither fail nor silently replay a request.
@@ -166,6 +178,7 @@ async def _client_session(app: web.Application) -> AsyncIterator[None]:
 
 
 async def _handle(request: web.Request) -> web.StreamResponse:
+    """Validate local identity and capacity, then own a relay slot until forwarding ends."""
     state = request.app[_STATE]
     if state.stopping:
         return _error(503)
@@ -203,6 +216,7 @@ async def _handle(request: web.Request) -> web.StreamResponse:
 async def _relay_http(
     request: web.Request, session: aiohttp.ClientSession, lb_port: int, raw_target: str, lb_token: str
 ) -> web.StreamResponse:
+    """Stream one bounded HTTP exchange, masking auth failures and aborting partial responses."""
     declared_length = request.content_length
     if declared_length is not None and declared_length > _MAX_BODY_BYTES:
         return _error(413)
@@ -238,11 +252,15 @@ async def _relay_http(
 
 
 class _BoundedRequestBody:
+    """Stream an upload with byte and idle limits, recording whether its size was exceeded."""
+
     def __init__(self, request: web.Request) -> None:
+        """Retain the inbound request and initialize its upload-limit status."""
         self._request = request
         self.exceeded = False
 
     async def chunks(self) -> AsyncIterator[bytes]:
+        """Yield raw upload chunks, raising on idle timeout or excess total body size."""
         received = 0
         while True:
             async with asyncio.timeout(IDLE_TIMEOUT_SECONDS):
@@ -257,6 +275,7 @@ class _BoundedRequestBody:
 
 
 async def _copy_response_body(upstream: aiohttp.ClientResponse, response: web.StreamResponse) -> None:
+    """Copy raw response chunks with a total byte limit and per-write idle deadline."""
     received = 0
     async for chunk in upstream.content.iter_any():
         received += len(chunk)
@@ -267,6 +286,7 @@ async def _copy_response_body(upstream: aiohttp.ClientResponse, response: web.St
 
 
 async def _relay_websocket(request: web.Request, lb_port: int, raw_target: str, lb_token: str) -> web.StreamResponse:
+    """Connect upstream before upgrading Desktop, then own both sockets through shutdown."""
     try:
         offered = policy.offered_subprotocols(request.headers.getall("Sec-WebSocket-Protocol", []))
     except policy.PolicyRejection as rejection:
@@ -330,6 +350,7 @@ async def _relay_websocket(request: web.Request, lb_port: int, raw_target: str, 
 
 
 def _handshake_rejection(handshake: HandshakeResponse) -> web.Response:
+    """Sanitize a refused upgrade, masking redirects and authentication failures as 502."""
     status = handshake.status_code
     if status < 200 or status == 401 or 300 <= status < 400:
         return _error(502)
@@ -341,6 +362,7 @@ def _handshake_rejection(handshake: HandshakeResponse) -> web.Response:
 
 
 async def _relay_messages(request: web.Request, websocket: web.WebSocketResponse, upstream: ClientConnection) -> None:
+    """Own both message pumps, enforce session deadlines, and propagate permitted close frames."""
     activity = _Activity()
     pumps = (
         asyncio.create_task(_client_to_upstream(websocket, upstream, activity)),
@@ -371,6 +393,7 @@ async def _relay_messages(request: web.Request, websocket: web.WebSocketResponse
 
 
 async def _close_websocket(request: web.Request, websocket: web.WebSocketResponse, frame: _CloseFrame) -> None:
+    """Attempt a bounded downstream close, aborting its transport if the close fails."""
     try:
         async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
             await websocket.close(code=frame.code, message=frame.reason.encode())
@@ -381,6 +404,7 @@ async def _close_websocket(request: web.Request, websocket: web.WebSocketRespons
 async def _client_to_upstream(
     websocket: web.WebSocketResponse, upstream: ClientConnection, activity: _Activity
 ) -> _CloseFrame:
+    """Forward Desktop text and binary messages unchanged and return its normalized close."""
     while True:
         message = await websocket.receive()
         if message.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
@@ -395,6 +419,7 @@ async def _client_to_upstream(
 async def _upstream_to_client(
     upstream: ClientConnection, websocket: web.WebSocketResponse, activity: _Activity
 ) -> _CloseFrame:
+    """Forward LB text and binary messages unchanged and return its normalized close."""
     with suppress(ConnectionClosed):
         async for message in upstream:
             activity.touch()
@@ -406,6 +431,7 @@ async def _upstream_to_client(
 
 
 def _relayable(code: int | None, reason: str | None) -> _CloseFrame:
+    """Preserve sendable close codes and reasons, substituting safe codes for reserved values."""
     # 1005 means the peer closed without a status code.
     if code is None or code == 1005:
         return _CloseFrame(1000, "")
@@ -416,6 +442,7 @@ def _relayable(code: int | None, reason: str | None) -> _CloseFrame:
 
 
 def _is_websocket_upgrade(request: web.Request) -> bool:
+    """Recognize a websocket token across all case-insensitive Upgrade header values."""
     return any(
         token.strip().lower() == "websocket"
         for value in request.headers.getall("Upgrade", [])
@@ -424,11 +451,13 @@ def _is_websocket_upgrade(request: web.Request) -> bool:
 
 
 def _abort(request: web.Request) -> None:
+    """Abort the downstream transport so incomplete data cannot appear successfully terminated."""
     if request.transport is not None:
         request.transport.abort()
 
 
 def _error(status: int) -> web.Response:
+    """Build a non-cacheable local error envelope containing no request or credential details."""
     return web.json_response(
         {"error": {"message": _ERROR_MESSAGES[status], "type": "desktop_bridge_error"}},
         status=status,

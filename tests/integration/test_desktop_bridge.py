@@ -31,15 +31,18 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 def write_private(path: Path, content: str) -> None:
+    """Write a synthetic credential file and restrict access to its owner."""
     path.write_text(content)
     path.chmod(0o600)
 
 
 def write_auth(path: Path, token: str = CLIENT_TOKEN) -> None:
+    """Create owner-only ChatGPT auth JSON containing a synthetic access token."""
     write_private(path, json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": token}}))
 
 
 def bound_socket() -> socket.socket:
+    """Reserve an ephemeral IPv4 loopback port on a nonblocking socket."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.setblocking(False)
@@ -48,6 +51,7 @@ def bound_socket() -> socket.socket:
 
 @asynccontextmanager
 async def serve(app: web.Application, sock: socket.socket) -> AsyncIterator[None]:
+    """Serve an aiohttp app on the supplied socket and always clean up both resources."""
     runner = web.AppRunner(app, access_log=None, handler_cancellation=True, shutdown_timeout=1)
     await runner.setup()
     try:
@@ -60,6 +64,8 @@ async def serve(app: web.Application, sock: socket.socket) -> AsyncIterator[None
 
 @dataclass
 class BridgeHarness:
+    """Expose the running bridge client, URL, and credential paths to integration tests."""
+
     client: aiohttp.ClientSession
     url: str
     auth_file: Path
@@ -68,8 +74,11 @@ class BridgeHarness:
 
 @pytest.fixture
 def bridge(tmp_path: Path):
+    """Provide an isolated bridge factory backed by temporary credentials and a local LB stub."""
+
     @asynccontextmanager
     async def start(handler: Handler) -> AsyncIterator[BridgeHarness]:
+        """Run the bridge and supplied upstream handler, yielding an authenticated test client."""
         auth_file = tmp_path / "auth.json"
         token_file = tmp_path / "lb-token"
         write_auth(auth_file)
@@ -92,7 +101,10 @@ def bridge(tmp_path: Path):
 
 @pytest.mark.parametrize("path", ["/backend-api/codex", "/backend-api/codex/", "/backend-api/codex/responses"])
 async def test_http_replaces_identity_preserves_metadata_and_duplicate_headers(bridge, path):
+    """Verify bidirectional header filtering while preserving duplicate metadata, raw targets, and bodies."""
+
     async def upstream(request):
+        """Assert sanitized LB-bound identity and payload, then return metadata mixed with private headers."""
         assert request.headers["Authorization"] == f"Bearer {LB_TOKEN}"
         for name in (
             "X-OpenAI-Actor-Authorization",
@@ -165,9 +177,11 @@ async def test_http_replaces_identity_preserves_metadata_and_duplicate_headers(b
     ],
 )
 async def test_rejected_identity_never_reaches_upstream(bridge, headers):
+    """Reject invalid credentials, authorities, and origins before contacting the LB."""
     calls = []
 
     async def upstream(request):
+        """Record any upstream dispatch so rejected requests cannot silently reach the LB."""
         calls.append(request.path)
         return web.Response()
 
@@ -190,9 +204,11 @@ async def test_rejected_identity_never_reaches_upstream(bridge, headers):
     ],
 )
 async def test_invalid_routes_never_reach_upstream(bridge, path):
+    """Reject non-Codex and ambiguous encoded paths before forwarding a request."""
     calls = []
 
     async def upstream(request):
+        """Record any route that bypasses the bridge target policy."""
         calls.append(request.path)
         return web.Response()
 
@@ -203,9 +219,11 @@ async def test_invalid_routes_never_reach_upstream(bridge, path):
 
 
 async def test_rotated_credentials_are_used_without_restart_and_never_written(bridge):
+    """Reload rotated client and LB tokens, reject stale identity, and fail closed on invalid auth JSON."""
     received = []
 
     async def upstream(request):
+        """Capture each forwarded bearer value to verify immediate LB token rotation."""
         received.append(request.headers["Authorization"])
         return web.Response(text="ok")
 
@@ -230,9 +248,11 @@ async def test_rotated_credentials_are_used_without_restart_and_never_written(br
 
 
 async def test_incomplete_credential_write_fails_closed_then_recovers_without_restart(bridge):
+    """Return 503 during a partial auth rewrite and accept the completed replacement token."""
     received = []
 
     async def upstream(request):
+        """Capture authorized dispatches to ensure incomplete credentials never reach the LB."""
         received.append(request.headers["Authorization"])
         return web.Response(text="ok")
 
@@ -256,9 +276,11 @@ async def test_incomplete_credential_write_fails_closed_then_recovers_without_re
 
 @pytest.mark.parametrize("status,expected", [(401, 502), (301, 502), (307, 502), (403, 403), (426, 426), (429, 429)])
 async def test_http_error_contract_has_no_refresh_or_redirect(bridge, status, expected):
+    """Map upstream authentication and redirect failures without retrying or leaking their bodies."""
     calls = []
 
     async def upstream(request):
+        """Return the selected failure and a redirect location while recording dispatch count."""
         calls.append(request.path)
         return web.Response(status=status, body=b"synthetic-upstream-error", headers={"Location": "/spy"})
 
@@ -272,10 +294,12 @@ async def test_http_error_contract_has_no_refresh_or_redirect(bridge, status, ex
 
 @pytest.mark.parametrize("encoding", ["gzip", "zstd"])
 async def test_compressed_request_and_response_are_opaque(bridge, encoding):
+    """Relay gzip and zstd payload bytes and encoding headers without decompression."""
     source = b'{"synthetic":"payload"}' * 100
     compressed = gzip.compress(source) if encoding == "gzip" else zstandard.ZstdCompressor().compress(source)
 
     async def upstream(request):
+        """Validate the compressed request bytes and echo them with their original encoding."""
         assert request.headers["Content-Encoding"] == encoding
         assert await request.read() == compressed
         return web.Response(body=compressed, headers={"Content-Encoding": encoding})
@@ -290,9 +314,11 @@ async def test_compressed_request_and_response_are_opaque(bridge, encoding):
 
 
 async def test_sse_streams_before_completion_and_cancels_on_client_disconnect(bridge):
+    """Deliver the first SSE event promptly and cancel upstream work when the client disconnects."""
     cancelled = asyncio.Event()
 
     async def upstream(request):
+        """Emit one SSE event, then wait indefinitely and signal when cancellation cleans up."""
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
         await response.write(b"data: synthetic-first\n\n")
@@ -310,9 +336,11 @@ async def test_sse_streams_before_completion_and_cancels_on_client_disconnect(br
 
 
 async def test_websocket_preserves_handshake_text_binary_large_messages_and_close(bridge, caplog):
+    """Relay large text, binary data, and close details while filtering handshake secrets and logs."""
     caplog.set_level(logging.DEBUG)
 
     async def upstream(request):
+        """Validate replaced identity, echo WebSocket messages, and close after the binary frame."""
         assert request.headers["Authorization"] == f"Bearer {LB_TOKEN}"
         assert "X-OpenAI-Actor-Authorization" not in request.headers
         assert "Cookie" not in request.headers
@@ -351,9 +379,11 @@ async def test_websocket_preserves_handshake_text_binary_large_messages_and_clos
 
 @pytest.mark.parametrize("status,expected", [(401, 502), (403, 403), (426, 426), (429, 429), (307, 502)])
 async def test_websocket_handshake_failure_and_redirect_policy(bridge, status, expected):
+    """Map failed WebSocket handshakes without following redirects or replaying requests."""
     calls = []
 
     async def upstream(request):
+        """Record a handshake attempt and return its configured failure with a redirect location."""
         calls.append(request.path)
         return web.Response(status=status, text="synthetic-error", headers={"Location": "/spy"})
 
@@ -365,10 +395,12 @@ async def test_websocket_handshake_failure_and_redirect_policy(bridge, status, e
 
 
 async def test_busy_limit_and_disconnect_release_request_slot(bridge, monkeypatch):
+    """Reject excess requests while streaming and restore capacity after client disconnect."""
     monkeypatch.setattr(relay, "MAX_ACTIVE_REQUESTS", 1)
     cancelled = asyncio.Event()
 
     async def upstream(request):
+        """Serve model probes immediately and hold other streams open until cancelled."""
         if request.path.endswith("models"):
             return web.Response(text="ok")
         response = web.StreamResponse()
@@ -392,10 +424,12 @@ async def test_busy_limit_and_disconnect_release_request_slot(bridge, monkeypatc
 
 
 async def test_request_limit_prevents_known_oversize_upstream_dispatch(bridge, monkeypatch):
+    """Reject requests with a known excessive body length before opening an upstream request."""
     monkeypatch.setattr(relay, "_MAX_BODY_BYTES", 32)
     calls = []
 
     async def upstream(request):
+        """Record any dispatch that would violate the known request-size limit."""
         calls.append(request.path)
         return web.Response()
 
@@ -406,9 +440,11 @@ async def test_request_limit_prevents_known_oversize_upstream_dispatch(bridge, m
 
 
 async def test_secrets_and_bodies_are_absent_from_logs(bridge, caplog):
+    """Keep tokens, query values, and request and response bodies out of debug logs."""
     caplog.set_level(logging.DEBUG)
 
     async def upstream(request):
+        """Return an authentication failure containing a recognizable synthetic secret body."""
         return web.Response(status=401, text="synthetic-secret-body")
 
     async with bridge(upstream) as h:
@@ -421,7 +457,10 @@ async def test_secrets_and_bodies_are_absent_from_logs(bridge, caplog):
 
 
 async def test_future_route_and_method_preserve_no_automatic_headers(bridge):
+    """Forward unfamiliar Codex routes and methods without inventing optional request headers."""
+
     async def upstream(request):
+        """Check the opaque PATCH request and return a nonstandard success status unchanged."""
         assert request.method == "PATCH"
         assert request.raw_path == "/backend-api/codex/future-feature/?opaque=%20%2f"
         for name in ("User-Agent", "Accept", "Accept-Encoding", "Content-Type"):
@@ -441,12 +480,14 @@ async def test_future_route_and_method_preserve_no_automatic_headers(bridge):
 
 @pytest.mark.parametrize("wire", ["http", "ws"])
 async def test_environment_proxies_are_ignored(bridge, monkeypatch, wire):
+    """Keep HTTP and WebSocket traffic on direct loopback connections despite proxy environment settings."""
     for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.setenv(name, "http://127.0.0.1:1")
     for name in ("NO_PROXY", "no_proxy"):
         monkeypatch.setenv(name, "")
 
     async def upstream(request):
+        """Respond over the selected transport to demonstrate direct access to the local LB."""
         if wire == "ws":
             ws = web.WebSocketResponse()
             await ws.prepare(request)
@@ -466,9 +507,11 @@ async def test_environment_proxies_are_ignored(bridge, monkeypatch, wire):
 
 @pytest.mark.parametrize("variant", ["duplicate-host", "missing-auth", "absolute-target", "trace"])
 async def test_raw_request_rejections_never_dispatch(bridge, variant):
+    """Reject malformed authority, identity, target, and method combinations sent over raw TCP."""
     calls = []
 
     async def upstream(request):
+        """Record any dispatch that escapes raw-request admission checks."""
         calls.append(request.path)
         return web.Response()
 
@@ -498,6 +541,7 @@ async def test_raw_request_rejections_never_dispatch(bridge, variant):
 
 @pytest.mark.parametrize("change", ["missing", "symlink", "public", "api-key", "other-mode", "multiline", "unicode"])
 async def test_invalid_credential_file_never_reaches_lb(bridge, change):
+    """Fail closed on missing, unsafe, or unsupported credentials without exposing their location."""
     if change == "public" and os.name != "posix":
         pytest.skip("POSIX ownership/mode contract")
     if change == "symlink" and not hasattr(os, "O_NOFOLLOW"):
@@ -505,6 +549,7 @@ async def test_invalid_credential_file_never_reaches_lb(bridge, change):
     calls = []
 
     async def upstream(request):
+        """Record any upstream request admitted after credentials become invalid."""
         calls.append(request.path)
         return web.Response()
 
@@ -533,7 +578,10 @@ async def test_invalid_credential_file_never_reaches_lb(bridge, change):
 
 
 async def test_truncated_upstream_response_does_not_complete_successfully(bridge):
+    """Surface premature upstream EOF as a gateway error or incomplete downstream payload."""
+
     async def upstream(request):
+        """Advertise a larger body than is sent, then close the transport abruptly."""
         response = web.StreamResponse(headers={"Content-Length": "100"})
         await response.prepare(request)
         await response.write(b"partial")
@@ -550,11 +598,13 @@ async def test_truncated_upstream_response_does_not_complete_successfully(bridge
 
 
 async def test_websocket_downstream_close_reaches_lb_and_releases_slot(bridge, monkeypatch):
+    """Forward the client close code and reason, then make the request slot reusable."""
     monkeypatch.setattr(relay, "MAX_ACTIVE_REQUESTS", 1)
     closed = asyncio.Event()
     received = []
 
     async def upstream(request):
+        """Capture the relayed WebSocket close details and answer later capacity probes."""
         if request.path.endswith("models"):
             return web.Response(text="available")
         ws = web.WebSocketResponse(autoclose=False)
@@ -579,11 +629,13 @@ async def test_websocket_downstream_close_reaches_lb_and_releases_slot(bridge, m
 
 
 async def test_abrupt_websocket_disconnect_closes_upstream_and_releases_slot(bridge, monkeypatch):
+    """Translate an aborted client transport into upstream close code 1001 and restore capacity."""
     monkeypatch.setattr(relay, "MAX_ACTIVE_REQUESTS", 1)
     closed = asyncio.Event()
     received = []
 
     async def upstream(request):
+        """Capture the upstream close frame and answer probes after cleanup."""
         if request.path.endswith("models"):
             return web.Response(text="available")
         ws = web.WebSocketResponse(autoclose=False)
@@ -622,10 +674,12 @@ async def test_abrupt_websocket_disconnect_closes_upstream_and_releases_slot(bri
 
 @pytest.mark.parametrize("limit", ["IDLE_TIMEOUT_SECONDS", "MAX_LIFETIME_SECONDS"])
 async def test_websocket_deadline_closes_both_sides(bridge, monkeypatch, limit):
+    """Close client and upstream WebSockets with code 1001 when idle or lifetime limits expire."""
     monkeypatch.setattr(relay, limit, 0.15)
     closed = asyncio.Event()
 
     async def upstream(request):
+        """Wait for bridge-initiated closure and signal that upstream cleanup completed."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await ws.receive()
@@ -642,10 +696,12 @@ async def test_websocket_deadline_closes_both_sides(bridge, monkeypatch, limit):
 
 
 async def test_chunked_request_limit_does_not_replay(bridge, monkeypatch):
+    """Reject a streamed request that crosses the body limit without replaying it upstream."""
     monkeypatch.setattr(relay, "_MAX_BODY_BYTES", 32)
     calls = []
 
     async def upstream(request):
+        """Record dispatch and tolerate cancellation while consuming the oversized upload."""
         calls.append(request.path)
         try:
             await request.read()
@@ -654,6 +710,7 @@ async def test_chunked_request_limit_does_not_replay(bridge, monkeypatch):
         return web.Response(text="unexpected completion")
 
     async def chunks():
+        """Yield an upload that crosses the patched body limit on its second chunk."""
         yield b"s" * 16
         yield b"s" * 17
 
@@ -664,9 +721,11 @@ async def test_chunked_request_limit_does_not_replay(bridge, monkeypatch):
 
 
 async def test_response_limit_never_reports_a_complete_oversize_body(bridge, monkeypatch):
+    """Expose an oversized streamed response as a gateway failure or incomplete payload."""
     monkeypatch.setattr(relay, "_MAX_BODY_BYTES", 32)
 
     async def upstream(request):
+        """Send two chunks whose combined length exceeds the patched response limit."""
         response = web.StreamResponse()
         await response.prepare(request)
         await response.write(b"s" * 16)
@@ -683,11 +742,13 @@ async def test_response_limit_never_reports_a_complete_oversize_body(bridge, mon
 
 
 async def test_http_idle_timeout_recovers_request_slot(bridge, monkeypatch):
+    """Return 502 for an idle upstream and release the occupied request slot after cancellation."""
     monkeypatch.setattr(relay, "IDLE_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(relay, "MAX_ACTIVE_REQUESTS", 1)
     cancelled = asyncio.Event()
 
     async def upstream(request):
+        """Stall response requests until cancelled while allowing model probes to finish."""
         if request.path.endswith("models"):
             return web.Response(text="available")
         try:
@@ -705,7 +766,10 @@ async def test_http_idle_timeout_recovers_request_slot(bridge, monkeypatch):
 
 
 async def test_response_cannot_enable_browser_access(bridge):
+    """Strip upstream CORS headers so a response cannot grant browser access."""
+
     async def upstream(request):
+        """Attempt to grant cross-origin credential access through response headers."""
         return web.Response(headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Credentials": "true"})
 
     async with bridge(upstream) as h:
@@ -715,9 +779,11 @@ async def test_response_cannot_enable_browser_access(bridge):
 
 
 async def test_malformed_http_parser_does_not_log_request_content(bridge, caplog):
+    """Reject malformed HTTP with 400 without logging the private bytes in its request line."""
     caplog.set_level(logging.DEBUG)
 
     async def upstream(request):
+        """Fail if parser-rejected input reaches the upstream handler."""
         pytest.fail("malformed request must not dispatch")
 
     async with bridge(upstream) as h:
@@ -734,10 +800,12 @@ async def test_malformed_http_parser_does_not_log_request_content(bridge, caplog
 
 @pytest.mark.parametrize("selected", [False, True])
 async def test_websocket_protocol_negotiation_does_not_log_offer(bridge, caplog, selected):
+    """Preserve accepted or declined subprotocol negotiation without logging the offered value."""
     caplog.set_level(logging.DEBUG)
     protocol = "synthetic-private-protocol"
 
     async def upstream(request):
+        """Accept or silently decline the offered subprotocol and send a confirmation message."""
         assert request.headers["Sec-WebSocket-Protocol"] == protocol
         ws = web.WebSocketResponse(protocols=[protocol] if selected else [])
         if not selected:
@@ -804,6 +872,7 @@ async def bridge_process(tmp_path: Path, lb_port: int) -> AsyncIterator[tuple[as
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
 @pytest.mark.parametrize("finish_http", [True, False])
 async def test_sigterm_closes_websocket_drains_or_aborts_http_and_releases_port(tmp_path, finish_http):
+    """Verify bounded SIGTERM cleanup, HTTP drain or abort, secret-free logs, and listener release."""
     finish = asyncio.Event()
     cancelled = asyncio.Event()
     upstream_closed = asyncio.Event()
@@ -811,6 +880,7 @@ async def test_sigterm_closes_websocket_drains_or_aborts_http_and_releases_port(
     close_codes = []
 
     async def upstream(request):
+        """Track WebSocket closure and stream HTTP until the test finishes it or shutdown cancels it."""
         calls.append(request.path)
         if request.path.endswith("responses"):
             ws = web.WebSocketResponse(autoclose=False)
@@ -870,9 +940,11 @@ async def test_sigterm_closes_websocket_drains_or_aborts_http_and_releases_port(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
 async def test_sigterm_closes_websockets_when_peers_do_not_acknowledge(tmp_path):
+    """Bound shutdown and close transports even when multiple clients ignore WebSocket close frames."""
     close_codes = []
 
     async def upstream(request):
+        """Record and acknowledge each shutdown close frame received from the bridge."""
         ws = web.WebSocketResponse(autoclose=False)
         await ws.prepare(request)
         message = await ws.receive()
@@ -918,12 +990,14 @@ async def test_sigterm_closes_websockets_when_peers_do_not_acknowledge(tmp_path)
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process signals")
 async def test_sigterm_rejects_upstream_handshake_that_completes_after_shutdown(tmp_path):
+    """Reject a late upstream handshake with 503 and close its WebSocket during shutdown."""
     received = asyncio.Event()
     release = asyncio.Event()
     closed = asyncio.Event()
     close_codes = []
 
     async def upstream(request):
+        """Delay handshake completion until shutdown starts, then observe the bridge closing it."""
         received.set()
         await release.wait()
         ws = web.WebSocketResponse(autoclose=False)
@@ -940,6 +1014,7 @@ async def test_sigterm_rejects_upstream_handshake_that_completes_after_shutdown(
         async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {CLIENT_TOKEN}"}) as client:
 
             async def connect():
+                """Start a client WebSocket handshake that can remain pending while shutdown begins."""
                 return await client.ws_connect(url + "/backend-api/codex/responses")
 
             handshake = asyncio.create_task(connect())
@@ -968,6 +1043,7 @@ async def test_sigterm_rejects_upstream_handshake_that_completes_after_shutdown(
 
 
 async def test_unavailable_upstream_recovers_when_lb_starts_without_bridge_restart(tmp_path):
+    """Recover from an unavailable LB on a later request without restarting the bridge."""
     write_auth(tmp_path / "auth.json")
     token_file = tmp_path / "lb-token"
     write_private(token_file, LB_TOKEN)
@@ -976,6 +1052,7 @@ async def test_unavailable_upstream_recovers_when_lb_starts_without_bridge_resta
     calls = []
 
     async def upstream(request):
+        """Verify LB credentials and record the successful request after the upstream starts."""
         calls.append(request.path)
         assert request.headers["Authorization"] == f"Bearer {LB_TOKEN}"
         return web.Response(text="ready")
